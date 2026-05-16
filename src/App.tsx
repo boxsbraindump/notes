@@ -41,6 +41,17 @@ type TreeReward = {
   lastWateredAt?: string;
 };
 
+type ProjectDragState = {
+  projectId: string;
+  pointerId: number;
+  offsetX: number;
+  offsetY: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
 const starterProjects: Project[] = [
   {
     id: 'memo',
@@ -281,8 +292,10 @@ export default function App() {
   const [organizeMessage, setOrganizeMessage] = useState('');
   const [manualTaskText, setManualTaskText] = useState('');
   const [armedProjectId, setArmedProjectId] = useState<string | null>(null);
-  const [draggedProjectId, setDraggedProjectId] = useState<string | null>(null);
+  const [projectDrag, setProjectDrag] = useState<ProjectDragState | null>(null);
+  const [trashIsActive, setTrashIsActive] = useState(false);
   const projectPressTimerRef = useRef<number | null>(null);
+  const projectTrashRef = useRef<HTMLDivElement | null>(null);
 
   const totalOpenTasks = useMemo(
     () => tasks.filter((task) => !task.done).length,
@@ -297,6 +310,10 @@ export default function App() {
     () => notes.filter((note) => note.projectId === selectedProjectId).slice(-3).reverse(),
     [notes, selectedProjectId]
   );
+  const draggedProjectId = projectDrag?.projectId ?? null;
+  const draggedProject = projectDrag
+    ? projects.find((project) => project.id === projectDrag.projectId)
+    : null;
 
   useEffect(() => {
     localStorage.setItem(projectStorageKey, JSON.stringify(projects));
@@ -324,22 +341,65 @@ export default function App() {
     }
   };
 
+  const isPointInsideElement = (element: HTMLElement | null, x: number, y: number) => {
+    if (!element) return false;
+    const rect = element.getBoundingClientRect();
+    return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+  };
+
+  const getProjectDropTarget = (x: number, y: number, draggingId: string) => {
+    const elements = document.elementsFromPoint(x, y);
+    const projectElement = elements.find((element) => {
+      if (!(element instanceof HTMLElement)) return false;
+      const projectId = element.dataset.projectId;
+      return projectId && projectId !== draggingId;
+    }) as HTMLElement | undefined;
+
+    return projectElement?.dataset.projectId ?? null;
+  };
+
   const handleProjectPressStart = (event: PointerEvent<HTMLElement>, projectId: string) => {
     if ((event.target as HTMLElement).closest('button')) return;
+    if (event.button !== 0) return;
     clearProjectPressTimer();
+    const card = event.currentTarget;
+    const pointerId = event.pointerId;
+    const startX = event.clientX;
+    const startY = event.clientY;
+
     projectPressTimerRef.current = window.setTimeout(() => {
+      const rect = card.getBoundingClientRect();
+      card.setPointerCapture(pointerId);
       setArmedProjectId(projectId);
+      setProjectDrag({
+        projectId,
+        pointerId,
+        offsetX: startX - rect.left,
+        offsetY: startY - rect.top,
+        x: rect.left,
+        y: rect.top,
+        width: rect.width,
+        height: rect.height,
+      });
+      setTrashIsActive(false);
     }, 420);
   };
 
-  const handleProjectDragStart = (event: DragEvent, projectId: string) => {
-    if (armedProjectId !== projectId) {
-      event.preventDefault();
-      return;
-    }
-    event.dataTransfer.setData('text/plain', projectId);
-    event.dataTransfer.effectAllowed = 'move';
-    setDraggedProjectId(projectId);
+  const handleProjectPointerMove = (event: PointerEvent<HTMLElement>) => {
+    if (!projectDrag || projectDrag.pointerId !== event.pointerId) return;
+    event.preventDefault();
+    const nextX = event.clientX - projectDrag.offsetX;
+    const nextY = event.clientY - projectDrag.offsetY;
+
+    setProjectDrag((current) => {
+      if (!current || current.pointerId !== event.pointerId) return current;
+      return {
+        ...current,
+        x: nextX,
+        y: nextY,
+      };
+    });
+    setTrashIsActive(isPointInsideElement(projectTrashRef.current, event.clientX, event.clientY));
   };
 
   const moveProjectBefore = (dragProjectId: string, targetProjectId: string) => {
@@ -368,8 +428,39 @@ export default function App() {
 
   const finishProjectDrag = () => {
     clearProjectPressTimer();
-    setDraggedProjectId(null);
+    setProjectDrag(null);
     setArmedProjectId(null);
+    setTrashIsActive(false);
+  };
+
+  const handleProjectPressEnd = (event: PointerEvent<HTMLElement>, projectId: string) => {
+    clearProjectPressTimer();
+    if (!projectDrag || projectDrag.projectId !== projectId || projectDrag.pointerId !== event.pointerId) {
+      return;
+    }
+
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+
+    if (isPointInsideElement(projectTrashRef.current, event.clientX, event.clientY)) {
+      deleteProject(projectId);
+      finishProjectDrag();
+      return;
+    }
+
+    const targetProjectId = getProjectDropTarget(event.clientX, event.clientY, projectId);
+    if (targetProjectId) moveProjectBefore(projectId, targetProjectId);
+    finishProjectDrag();
+  };
+
+  const cancelProjectOrganizingFromBlank = (event: PointerEvent<HTMLElement>) => {
+    if (!armedProjectId && !projectDrag) return;
+    const target = event.target as HTMLElement;
+    if (target.closest('[data-project-id], .project-trash, button, input, textarea, [role="dialog"]')) {
+      return;
+    }
+    finishProjectDrag();
   };
 
   const resetCreateForm = () => {
@@ -721,9 +812,34 @@ export default function App() {
     );
   }
 
+  const renderProjectCardContent = (project: Project, isPreview = false) => (
+    <>
+      <div>
+        <span className="project-pill">{project.updatedAt}</span>
+        <h2>{project.name}</h2>
+        <p>{project.description}</p>
+      </div>
+      <div className="project-footer">
+        <span>{openTaskCount(project.id)} 个待办</span>
+        {isPreview ? (
+          <span className="project-entry-preview">进入</span>
+        ) : (
+          <Button
+            size="small"
+            type="default"
+            onPointerDown={(event) => event.stopPropagation()}
+            onClick={() => setSelectedProjectId(project.id)}
+          >
+            进入
+          </Button>
+        )}
+      </div>
+    </>
+  );
+
   return (
     <Cursor>
-    <main className="app-shell">
+    <main className="app-shell" onPointerDown={cancelProjectOrganizingFromBlank}>
       <section className="island-topbar" aria-label="项目总览">
         <div>
           <p className="eyebrow">ADHD Animal Island Memo</p>
@@ -753,60 +869,49 @@ export default function App() {
           <Card
             key={project.id}
             color={project.color}
+            data-project-id={project.id}
             className={[
               'project-card',
               armedProjectId === project.id && 'project-card-armed',
-              draggedProjectId === project.id && 'project-card-dragging',
+              draggedProjectId === project.id && 'project-card-placeholder',
             ]
               .filter(Boolean)
               .join(' ')}
-            draggable={armedProjectId === project.id}
             onPointerDown={(event) => handleProjectPressStart(event, project.id)}
-            onPointerUp={clearProjectPressTimer}
-            onPointerCancel={clearProjectPressTimer}
+            onPointerMove={handleProjectPointerMove}
+            onPointerUp={(event) => handleProjectPressEnd(event, project.id)}
+            onPointerCancel={finishProjectDrag}
             onPointerLeave={clearProjectPressTimer}
-            onDragStart={(event) => handleProjectDragStart(event, project.id)}
-            onDragOver={(event) => event.preventDefault()}
-            onDrop={(event) => {
-              event.preventDefault();
-              const dragProjectId = event.dataTransfer.getData('text/plain');
-              if (dragProjectId) moveProjectBefore(dragProjectId, project.id);
-              finishProjectDrag();
-            }}
-            onDragEnd={finishProjectDrag}
           >
-            <div>
-              <span className="project-pill">{project.updatedAt}</span>
-              <h2>{project.name}</h2>
-              <p>{project.description}</p>
-            </div>
-            <div className="project-footer">
-              <span>{openTaskCount(project.id)} 个待办</span>
-              <Button
-                size="small"
-                type="default"
-                onPointerDown={(event) => event.stopPropagation()}
-                onClick={() => setSelectedProjectId(project.id)}
-              >
-                进入
-              </Button>
-            </div>
+            {renderProjectCardContent(project)}
           </Card>
         ))}
       </section>
 
       {(armedProjectId || draggedProjectId) && (
         <div
-          className="project-trash"
-          onDragOver={(event) => event.preventDefault()}
-          onDrop={(event) => {
-            event.preventDefault();
-            const projectId = event.dataTransfer.getData('text/plain');
-            if (projectId) deleteProject(projectId);
-            finishProjectDrag();
-          }}
+          ref={projectTrashRef}
+          className={['project-trash', trashIsActive && 'project-trash-active']
+            .filter(Boolean)
+            .join(' ')}
         >
           <span>拖到这里删除项目</span>
+        </div>
+      )}
+
+      {projectDrag && draggedProject && (
+        <div
+          className="project-drag-layer"
+          style={{
+            left: projectDrag.x,
+            top: projectDrag.y,
+            width: projectDrag.width,
+            height: projectDrag.height,
+          }}
+        >
+          <Card color={draggedProject.color} className="project-card project-card-lifted">
+            {renderProjectCardContent(draggedProject, true)}
+          </Card>
         </div>
       )}
 
